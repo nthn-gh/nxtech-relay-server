@@ -138,6 +138,12 @@ wss.on('connection', (ws) => {
     const target = current ? current[peerRole(role)] : null
     if (target && target.readyState === target.OPEN) {
       target.send(data, { binary: isBinary })
+    } else if (role === 'client') {
+      // No host attached — tell the client immediately instead of letting the
+      // message vanish until its own dispatch timeout fires.
+      try {
+        ws.send(JSON.stringify({ type: 'relay-error', code: 'HOST_UNAVAILABLE' }))
+      } catch (_) {}
     }
   })
 
