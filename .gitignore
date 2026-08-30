@@ -1,2 +1,16 @@
+# Real subscriber/entitlement data -- never committed. The monorepo's own
+# relay-server/.gitignore doesn't list this because that copy only ever
+# holds an empty {"subscribers":[]} placeholder; this deployment's copy
+# holds real shop machine IDs/labels/notes, so this line is preserved from
+# this repo's own .gitignore rather than overwritten by the monorepo's.
 subscribers.json
+
 node_modules/
+*.log
+.env
+
+# Remote Monitoring Dashboard runtime data -- live per-deployment SQLite
+# store (shops, sync tokens, snapshots, sessions), never a fixture.
+monitoring.db
+monitoring.db-wal
+monitoring.db-shm

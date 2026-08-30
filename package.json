@@ -2,7 +2,7 @@
   "name": "nxtech-pos-relay",
   "version": "1.0.0",
   "private": true,
-  "description": "WebSocket pairing/relay server for NXTech POS Pro Remote Access add-on",
+  "description": "WebSocket pairing/relay server for NXTech POS Pro Remote Access add-on, plus Remote Monitoring Dashboard sync/dashboard ingestion",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -12,6 +12,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "better-sqlite3": "^12.9.0",
     "ws": "^8.18.0"
   }
 }

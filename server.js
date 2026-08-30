@@ -45,11 +45,34 @@ import { randomBytes } from 'crypto'
 import { isActive } from './subscribers.js'
 import { startAdminServer } from './admin.js'
 import { checkAndConsume, sweepExpired } from './rateLimiter.js'
+import { getDbFileSizeBytes, pruneOldSnapshots } from './db.js'
+import {
+  handleSyncRegister,
+  handleSyncPush,
+  handlePairingCodeGenerate,
+  handleSessionsList,
+  handleSessionRevoke
+} from './sync.js'
+import { handleDashboardClaim, handleDashboardEntityList, handleDashboardOptions } from './dashboard.js'
 
 const PORT = Number(process.env.PORT || process.env.RELAY_PORT || 8787)
 const HOST = process.env.HOST || '0.0.0.0'
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 30000)
 const MAX_CODE_LENGTH = 128
+
+// URL slug (what a dashboard client requests) -> internal entity_type
+// (what the app's outbox / this relay's snapshots table actually store).
+const DASHBOARD_ENTITY_ROUTES = {
+  sales: 'sale',
+  'job-orders': 'job_order',
+  inventory: 'inventory',
+  expenses: 'expense',
+  'daily-closing': 'daily_closing'
+}
+
+// How often pruneOldSnapshots() (12-month rolling retention, db.js) runs.
+// Daily is more than enough for a bound that only matters over months.
+const SNAPSHOT_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 // code -> { host: ws|null, client: ws|null }
 const pairings = new Map()
@@ -156,8 +179,67 @@ function cleanupPairing(code) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && (req.url === '/health' || req.url.startsWith('/health?'))) {
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, activePairings: activePairingCount() }))
+    // monitoringDbBytes is basic disk-usage visibility for the Remote
+    // Monitoring snapshot store (finding #7) -- not a full alerting
+    // pipeline, just enough to notice unbounded growth from the same
+    // /health an operator (or uptime monitor) already polls.
+    res.end(
+      JSON.stringify({
+        ok: true,
+        activePairings: activePairingCount(),
+        monitoringDbBytes: getDbFileSizeBytes()
+      })
+    )
     return
+  }
+
+  // ---------------------------------------------------------------------
+  // Remote Monitoring Dashboard -- app-facing sync API (sync.js). Own
+  // credential family (sync_token), entirely separate from the pairing
+  // code above (see module header comments in sync.js/dashboard.js).
+  // ---------------------------------------------------------------------
+  if (req.method === 'POST' && req.url.startsWith('/sync/register')) {
+    handleSyncRegister(req, res)
+    return
+  }
+  if (req.method === 'POST' && req.url.startsWith('/sync/push')) {
+    handleSyncPush(req, res)
+    return
+  }
+  if (req.method === 'POST' && req.url.startsWith('/sync/pairing-code')) {
+    handlePairingCodeGenerate(req, res)
+    return
+  }
+  if (req.method === 'GET' && req.url.startsWith('/sync/sessions')) {
+    handleSessionsList(req, res)
+    return
+  }
+  if (req.method === 'POST' && req.url.startsWith('/sync/sessions/revoke')) {
+    handleSessionRevoke(req, res)
+    return
+  }
+
+  // ---------------------------------------------------------------------
+  // Remote Monitoring Dashboard -- browser-facing API (dashboard.js).
+  // ---------------------------------------------------------------------
+  if (req.method === 'OPTIONS' && req.url.startsWith('/dashboard/')) {
+    handleDashboardOptions(req, res)
+    return
+  }
+  if (req.method === 'POST' && req.url.startsWith('/dashboard/claim')) {
+    handleDashboardClaim(req, res)
+    return
+  }
+  // /dashboard/:entityType -- basic snapshot list, one route per known
+  // entity type (URL uses the app's own naming; DASHBOARD_ENTITY_ROUTES
+  // maps the URL slug to the internal entity_type stored in `snapshots`).
+  if (req.method === 'GET' && req.url.startsWith('/dashboard/')) {
+    const slug = req.url.split('?')[0].slice('/dashboard/'.length)
+    const entityType = DASHBOARD_ENTITY_ROUTES[slug]
+    if (entityType) {
+      handleDashboardEntityList(req, res, entityType)
+      return
+    }
   }
 
   // Mobile Data QR Job Order Tracking. req.url carries the query string
@@ -1119,6 +1201,26 @@ const heartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeat))
 
+// Remote Monitoring Dashboard: 12-month rolling retention (finding #6),
+// applied only to this relay's snapshot store -- the shop's local SQLite
+// database is unaffected either way. Once daily is plenty for a bound
+// that only matters over months; also runs once at startup so a
+// long-running process doesn't wait a full day for its first prune.
+const snapshotPruneTimer = setInterval(() => {
+  try {
+    const dropped = pruneOldSnapshots()
+    if (dropped > 0) log(`[monitoring] pruned ${dropped} snapshot row(s) older than the retention window`)
+  } catch (err) {
+    log(`[monitoring] snapshot prune failed: ${err.message}`)
+  }
+}, SNAPSHOT_PRUNE_INTERVAL_MS)
+snapshotPruneTimer.unref()
+try {
+  pruneOldSnapshots()
+} catch (err) {
+  log(`[monitoring] initial snapshot prune failed: ${err.message}`)
+}
+
 server.listen(PORT, HOST, () => {
   log(`Relay server listening on ${HOST}:${PORT} (heartbeat ${HEARTBEAT_MS}ms)`)
 })
@@ -1131,6 +1233,7 @@ log(`Admin server listening on 127.0.0.1:${ADMIN_PORT}`)
 function shutdown(signal) {
   log(`Received ${signal}, shutting down...`)
   clearInterval(heartbeat)
+  clearInterval(snapshotPruneTimer)
   for (const ws of wss.clients) {
     try {
       ws.close(1001, 'Server shutting down')
