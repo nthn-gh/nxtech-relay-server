@@ -60,13 +60,15 @@ connected.
 
 ## Configuration
 
-All optional, via environment variables:
+Via environment variables:
 
-| Variable       | Default   | Description                              |
-| -------------- | --------- | ---------------------------------------- |
-| `PORT`         | `8787`    | TCP port to listen on.                   |
-| `HOST`         | `0.0.0.0` | Bind address.                            |
-| `HEARTBEAT_MS` | `30000`   | Ping interval; dead sockets are dropped. |
+| Variable       | Default     | Description                                                                                   |
+| -------------- | ----------- | ----------------------------------------------------------------------------------------------- |
+| `PORT`         | `8787`      | TCP port the relay (WS pairing) listens on.                                                     |
+| `HOST`         | `0.0.0.0`   | Relay bind address.                                                                              |
+| `HEARTBEAT_MS` | `30000`     | Ping interval; dead sockets are dropped.                                                         |
+| `ADMIN_PORT`   | `3001`      | Port the admin API (`admin.js`) listens on — always bound to `127.0.0.1` only, never public.     |
+| `ADMIN_TOKEN`  | *(none)*    | Bearer token required on every admin API request except `/health`. **Effectively required**, not truly optional — if unset, the admin API logs a warning at startup and rejects every authenticated request with 401. |
 
 ## Run locally
 
@@ -100,6 +102,23 @@ Type a message in either terminal and it appears in the other. `curl /health`
 now reports `"activePairings":1`. Leave them idle past 30s to confirm the
 heartbeat keeps the (healthy) connections alive. Close one terminal and the
 other stays open, waiting for its peer to reconnect with the same code.
+
+### Automated smoke test (app message protocol)
+
+From the main app repo root there's a one-shot smoke test that pairs a
+host + client and verifies request → response and event forwarding (the exact
+protocol the app uses). It reads `RELAY_URL` from `.env`, or takes an override:
+
+```bash
+# Uses RELAY_URL from .env, generated TEST- code
+npm run smoke:relay
+
+# Explicit code and relay URL
+node scripts/relay-smoke-test.js TEST-mycode wss://relay.nxtech.online
+```
+
+It prints PASS/FAIL per check and exits non-zero on failure — handy for
+verifying a freshly deployed relay.
 
 ## Deployment (VPS, `wss://` via nginx + Let's Encrypt)
 
@@ -218,5 +237,8 @@ curl https://relay.example.com/health
 
 ## Files
 
-- `server.js` — the relay (HTTP `/health` + WS `/connect`, heartbeat, pairing).
+- `server.js` — the relay (HTTP `/health` + WS `/connect`, heartbeat, pairing, per-feature subscription gate).
+- `admin.js` — loopback-only HTTP admin API (`127.0.0.1:$ADMIN_PORT`) for granting/revoking a subscriber's `remote_access`/`mobile_data` entitlement, e.g. after manually confirming a GCash payment. See the endpoint table above.
+- `subscribers.js` — the subscriber whitelist module: loads/saves `subscribers.json`, per-feature `isActive()`/`setActive()`, and a one-time shape migration for records still using the old single `active` boolean.
+- `subscribers.json` — the on-disk whitelist (created on first write if missing). Not committed to version control on the VPS — treat it as live subscriber data, not a fixture.
 - `package.json` — depends only on `ws`.

@@ -1,0 +1,39 @@
+{
+  "subscribers": [
+    {
+      "machineId": "4E4F789C57B95FEC",
+      "label": "NXTech",
+      "active": true,
+      "notes": "Admin",
+      "addedAt": "2026-06-16T05:03:37.848Z"
+    },
+    {
+      "machineId": "F34DFB0180F7D5CC",
+      "label": "KL Printing",
+      "active": true,
+      "notes": "",
+      "addedAt": "2026-06-18T09:25:41.720Z"
+    },
+    {
+      "machineId": "5BF952240587A596",
+      "label": "Prime Signages 3D Printing Hub",
+      "active": true,
+      "notes": "Monthly 24th of the Month",
+      "addedAt": "2026-06-24T06:39:18.181Z"
+    },
+    {
+      "machineId": "FEBF5F6E28AF26D2",
+      "label": "SKyler",
+      "active": true,
+      "notes": "",
+      "addedAt": "2026-07-06T04:58:48.302Z"
+    },
+    {
+      "machineId": "E81A97AD616012EC",
+      "label": "Seven Oceans Gallery",
+      "active": true,
+      "notes": "",
+      "addedAt": "2026-07-08T23:08:28.428Z"
+    }
+  ]
+}

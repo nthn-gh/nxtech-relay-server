@@ -1,0 +1,24 @@
+npm error Missing script: "dev"
+npm error
+npm error To see a list of scripts, run:
+npm error   npm run
+npm error A complete log of this run can be found in: C:\Users\Ethan\AppData\Local\npm-cache\_logs\2026-06-14T12_13_32_982Z-debug-0.log
+nohup: ignoring input
+2026-07-15T15:08:53.088Z [admin] WARNING: ADMIN_TOKEN is not set — admin API will reject every request
+2026-07-15T15:08:53.095Z Admin server listening on 127.0.0.1:3001
+2026-07-15T15:08:53.106Z Relay server listening on 0.0.0.0:8787 (heartbeat 30000ms)
+2026-07-15T15:08:54.282Z [relay] ALLOWED host machineId=FEBF5F6E28AF26D2
+2026-07-15T15:08:54.287Z [ee1b...] host connected (waiting for client)
+2026-07-15T15:08:54.288Z [DIAG] about to send entitlement to machineId=FEBF5F6E28AF26D2, readyState=1, features= { remote_access: true, mobile_data: false }
+2026-07-15T15:08:54.292Z [DIAG] entitlement send() call completed without throwing for machineId=FEBF5F6E28AF26D2
+2026-07-15T15:08:54.302Z [ee1b...] client connected (paired with host)
+2026-07-15T15:09:18.350Z [relay] ALLOWED host machineId=4E4F789C57B95FEC
+2026-07-15T15:09:18.351Z [e0d0...] host connected (waiting for client)
+2026-07-15T15:09:18.351Z [DIAG] about to send entitlement to machineId=4E4F789C57B95FEC, readyState=1, features= { remote_access: true, mobile_data: true }
+2026-07-15T15:09:18.352Z [DIAG] entitlement send() call completed without throwing for machineId=4E4F789C57B95FEC
+2026-07-15T15:16:56.615Z [e0d0...] host disconnected
+2026-07-15T16:34:33.439Z [relay] ALLOWED host machineId=4E4F789C57B95FEC
+2026-07-15T16:34:33.440Z [e0d0...] host connected (waiting for client)
+2026-07-15T16:34:33.441Z [DIAG] about to send entitlement to machineId=4E4F789C57B95FEC, readyState=1, features= { remote_access: true, mobile_data: true }
+2026-07-15T16:34:33.441Z [DIAG] entitlement send() call completed without throwing for machineId=4E4F789C57B95FEC
+2026-07-15T16:39:07.778Z [e0d0...] host disconnected

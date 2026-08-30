@@ -23,20 +23,6 @@
  *        Body is the raw file bytes; Content-Type is used as the mimeType.
  *   GET  /mobile-upload/:uploadToken        -> one-time fetch of a staged
  *        file's bytes (Host-initiated, over a plain HTTPS request).
- *   GET  /track/:jobId/:slug?code=<code>    -> Mobile Data QR Job Order
- *        Tracking. This relay does NOT render the tracking page itself — it
- *        forwards jobId+slug to the paired Host over the existing WS
- *        connection and proxies back whatever HTML the Host renders
- *        (reusing the exact same template the LAN tracking route uses).
- *        See pendingTrackRequests below.
- *   GET  /?code=<code>                      -> public Loyalty Points lookup
- *        phone-entry form (meant to be reached via a dedicated
- *        points.nxtech.online subdomain pointed at this same process).
- *   POST /lookup?code=<code>                -> the actual phone lookup,
- *        body is x-www-form-urlencoded phone=<value>. Same Host-round-trip
- *        proxy pattern as /track (see pendingPointsRequests below), plus an
- *        IP+code rate limit (rateLimiter.js) since this endpoint has no
- *        other access control — a phone number alone is not a secret.
  */
 
 import http from 'http'
@@ -44,7 +30,6 @@ import { WebSocketServer } from 'ws'
 import { randomBytes } from 'crypto'
 import { isActive } from './subscribers.js'
 import { startAdminServer } from './admin.js'
-import { checkAndConsume, sweepExpired } from './rateLimiter.js'
 
 const PORT = Number(process.env.PORT || process.env.RELAY_PORT || 8787)
 const HOST = process.env.HOST || '0.0.0.0'
@@ -63,46 +48,6 @@ const pairings = new Map()
 const stagedUploads = new Map()
 const MOBILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 // 25MB
 const MOBILE_UPLOAD_TTL_MS = 5 * 60 * 1000 // 5 minutes
-
-// Mobile Data QR Job Order Tracking — a phone's GET /track request is held
-// open (its `res` kept here) while we wait for the paired Host to answer
-// over the existing WS connection. Deliberately a SEPARATE Map from
-// `pairings` (additive only — this must never change pairings' existing
-// shape/keying, which the Received Files Mobile Data path also depends on).
-// id -> { res, timer, code }
-const pendingTrackRequests = new Map()
-const TRACK_PATH_RE = /^\/track\/(\d+)\/([a-f0-9]{12})$/
-const TRACK_REQUEST_TIMEOUT_MS = 8000
-// Two caps, not one: per-code protects one shop's single Host WS connection
-// from being buried under its own customers' polling; global protects this
-// relay's overall memory if something is broadly wrong (e.g. many hosts
-// simultaneously unresponsive). Both are generous relative to the current
-// scale (~5 subscribers) — they exist to bound a broken/stuck Host, not to
-// constrain normal traffic.
-const MAX_PENDING_TRACK_PER_CODE = 5
-const MAX_PENDING_TRACK_GLOBAL = 100
-
-// Public Loyalty Points lookup (phone number entry) — a PARALLEL SIBLING to
-// the tracking pending-map above, not a shared pool. pendingTrackRequests'
-// caps/dispatch are hardcoded to "track" throughout this file (entry shape
-// has no `type` discriminator, the WS handler matches on the literal string
-// 'track_response'), so sharing the same Map/caps would need a refactor of
-// that existing code — out of this feature's risk budget. Copy-and-rename
-// instead, exactly mirroring pendingTrackRequests' shape and constants.
-// id -> { res, timer, code }
-const pendingPointsRequests = new Map()
-const POINTS_REQUEST_TIMEOUT_MS = 8000
-const MAX_PENDING_POINTS_PER_CODE = 5
-const MAX_PENDING_POINTS_GLOBAL = 100
-
-// Rate limit for the actual phone lookup (not page views of the static
-// form) — IP+code keyed, so one IP hammering one shop's code is limited
-// independently of that same IP trying a different shop's code. Generous
-// enough for a customer who mistypes their number a couple of times;
-// tight enough to meaningfully blunt casual phone-number enumeration.
-const POINTS_LOOKUP_RATE_LIMIT = 5
-const POINTS_LOOKUP_RATE_WINDOW_MS = 5 * 60 * 1000 // 5 minutes
-const POINTS_LOOKUP_MAX_BODY_BYTES = 1024
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -127,22 +72,6 @@ function peerRole(role) {
   return role === 'host' ? 'client' : 'host'
 }
 
-// nginx (see README.md's documented reverse-proxy config) already sets
-// X-Forwarded-For on every request; this Node process just never read it
-// before now. Takes the FIRST address in the (possibly comma-separated)
-// header, since that's the original client — everything after it is
-// intermediate proxies. Falls back to the raw socket address (useful when
-// testing without nginx in front, and a defensive fallback if the header is
-// ever absent in production).
-function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for']
-  if (forwarded) {
-    const first = String(forwarded).split(',')[0].trim()
-    if (first) return first
-  }
-  return req.socket?.remoteAddress || 'unknown'
-}
-
 function cleanupPairing(code) {
   const pair = pairings.get(code)
   if (pair && !pair.host && !pair.client) {
@@ -157,13 +86,6 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && (req.url === '/health' || req.url.startsWith('/health?'))) {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ ok: true, activePairings: activePairingCount() }))
-    return
-  }
-
-  // Mobile Data QR Job Order Tracking. req.url carries the query string
-  // (?code=...), so match against the pathname only.
-  if (req.method === 'GET' && TRACK_PATH_RE.test(req.url.split('?')[0])) {
-    handleTrackRequest(req, res, req.url.split('?')[0])
     return
   }
 
@@ -189,23 +111,6 @@ const server = http.createServer((req, res) => {
   // segment; the check above already claimed /mobile-upload/<token>).
   if (req.method === 'GET' && req.url.startsWith('/mobile-upload')) {
     handleMobileUploadPage(req, res)
-    return
-  }
-
-  // Public Loyalty Points lookup — the actual phone lookup (rate-limited).
-  if (req.method === 'POST' && req.url.startsWith('/lookup')) {
-    handlePointsLookup(req, res)
-    return
-  }
-
-  // Points-lookup phone-entry form, served at the bare root so
-  // points.nxtech.online/?code=<code> is the clean customer-facing URL —
-  // this relay has no other route at '/' today, and nginx can point either
-  // relay.nxtech.online or a dedicated points.nxtech.online at this same
-  // process (see relay-server/README.md's deployment section for adding a
-  // new server_name + cert).
-  if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'))) {
-    handlePointsFormPage(req, res)
     return
   }
 
@@ -616,294 +521,6 @@ function handleMobileUploadLink(req, res) {
   })
 }
 
-// ---------------------------------------------------------------------------
-// Mobile Data QR Job Order Tracking
-// ---------------------------------------------------------------------------
-
-function sendTrackHtml(res, status, html) {
-  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' })
-  res.end(html)
-}
-
-// Deliberately NOT the same page as the Host's "not found" (invalid slug)
-// state — that's the Host's call to make (it owns getPublicJobOrderStatus's
-// not-found decision), proxied back verbatim. This page is this relay's OWN
-// concern only: no Host connected, no answer within the timeout, or the
-// concurrency cap was hit. Styled to match the Host-rendered tracking pages
-// (jobOrderTrackingServer.js's pageShell) even though this relay can't
-// import that module directly (separate deployable package, no shared
-// module boundary) — so a customer sees one consistent visual language
-// regardless of which page they land on.
-function unreachablePageHtml() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Shop Unreachable</title>
-<style>
-body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0f172a;margin:0;padding:32px 16px;color:#0f172a;min-height:100vh;box-sizing:border-box}
-.card{max-width:420px;margin:0 auto;background:#fff;border-radius:16px;padding:28px 24px;box-shadow:0 8px 24px rgba(0,0,0,.25);text-align:center}
-.msg{font-size:15px;color:#334155;line-height:1.5}
-</style></head><body><div class="card"><div class="msg">We couldn't reach the shop right now. Please try again in a bit.</div></div></body></html>`
-}
-
-// Same visual language as unreachablePageHtml() — a distinct message so a
-// customer who's just retrying too fast isn't told "the shop is
-// unreachable" (misleading; the shop is fine, they just need to wait).
-function tooManyAttemptsPageHtml() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Please Wait</title>
-<style>
-body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0f172a;margin:0;padding:32px 16px;color:#0f172a;min-height:100vh;box-sizing:border-box}
-.card{max-width:420px;margin:0 auto;background:#fff;border-radius:16px;padding:28px 24px;box-shadow:0 8px 24px rgba(0,0,0,.25);text-align:center}
-.msg{font-size:15px;color:#334155;line-height:1.5}
-</style></head><body><div class="card"><div class="msg">Too many attempts. Please wait a few minutes and try again.</div></div></body></html>`
-}
-
-function countPendingTrackForCode(code) {
-  let n = 0
-  for (const entry of pendingTrackRequests.values()) {
-    if (entry.code === code) n++
-  }
-  return n
-}
-
-// Called when a 'track_response' arrives from the Host (see the connection
-// message handler below) OR when a pending request's timeout fires —
-// whichever happens first wins; the other becomes a no-op via the Map
-// lookup (an already-resolved/timed-out id is simply absent).
-function resolveTrackRequest(id, status, html) {
-  const entry = pendingTrackRequests.get(id)
-  if (!entry) return
-  clearTimeout(entry.timer)
-  pendingTrackRequests.delete(id)
-  sendTrackHtml(entry.res, Number(status) || 200, String(html || ''))
-}
-
-// GET /track/:jobId/:slug?code=<code>
-function handleTrackRequest(req, res, pathname) {
-  const match = TRACK_PATH_RE.exec(pathname)
-  // The caller only routes matching paths here; kept as a defensive
-  // fallback in case that ever changes.
-  if (!match) {
-    res.writeHead(404, { 'Content-Type': 'application/json' })
-    return res.end(JSON.stringify({ ok: false, error: 'Not found' }))
-  }
-  const [, jobId, slug] = match
-
-  let parsedUrl
-  try {
-    parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-  } catch (_) {
-    return sendTrackHtml(res, 400, unreachablePageHtml())
-  }
-  const code = (parsedUrl.searchParams.get('code') || '').trim()
-
-  if (!code || code.length > MAX_CODE_LENGTH) {
-    return sendTrackHtml(res, 400, unreachablePageHtml())
-  }
-
-  const pair = pairings.get(code)
-  const hostWs = pair && pair.host
-  if (!hostWs || hostWs.readyState !== hostWs.OPEN) {
-    // No Host at all — respond immediately, no need to wait out the timeout.
-    return sendTrackHtml(res, 503, unreachablePageHtml())
-  }
-
-  if (
-    pendingTrackRequests.size >= MAX_PENDING_TRACK_GLOBAL ||
-    countPendingTrackForCode(code) >= MAX_PENDING_TRACK_PER_CODE
-  ) {
-    log(`[track] rejecting request for code=${maskCode(code)} — concurrency cap reached`)
-    return sendTrackHtml(res, 503, unreachablePageHtml())
-  }
-
-  const id = randomBytes(8).toString('hex')
-  const timer = setTimeout(() => {
-    log(`[track] request ${id.slice(0, 8)}... timed out waiting for Host (code=${maskCode(code)})`)
-    resolveTrackRequest(id, 503, unreachablePageHtml())
-  }, TRACK_REQUEST_TIMEOUT_MS)
-
-  pendingTrackRequests.set(id, { res, timer, code })
-
-  try {
-    hostWs.send(JSON.stringify({ type: 'track_request', id, jobId, slug }))
-  } catch (_) {
-    clearTimeout(timer)
-    pendingTrackRequests.delete(id)
-    return sendTrackHtml(res, 503, unreachablePageHtml())
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Public Loyalty Points lookup (phone number entry)
-// ---------------------------------------------------------------------------
-
-function sendPointsHtml(res, status, html, closeConnection) {
-  const headers = { 'Content-Type': 'text/html; charset=utf-8' }
-  if (closeConnection) headers.Connection = 'close'
-  res.writeHead(status, headers)
-  res.end(html)
-}
-
-// The phone-entry form page. A plain native <form method="POST"> submission
-// (unlike mobile-upload's fetch()-based page) — the results ARE a full
-// rendered HTML document from the Host (or this relay's own error page), so
-// a normal form POST + browser navigation is simplest: no client-side JS
-// needed at all, nothing to keep in sync with a JSON response shape.
-function pointsLookupFormHtml(code) {
-  const safeCode = escapeHtml(code)
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Check Your Points</title>
-<style>
-body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#f8fafc;margin:0;padding:32px 16px;color:#0f172a}
-.card{max-width:420px;margin:0 auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
-h1{font-size:18px;margin:0 0 16px}
-input[type=tel]{width:100%;padding:14px;border:1px solid #cbd5e1;border-radius:8px;margin-bottom:16px;box-sizing:border-box;font-size:16px}
-button{width:100%;padding:14px;background:#2563eb;color:#fff;border:0;border-radius:8px;font-size:16px;font-weight:600}
-.status{font-size:14px;color:#dc2626;margin-top:12px}
-</style></head><body>
-<div class="card">
-  <h1>Check your points balance</h1>
-  ${!code ? '<div class="status">Invalid or missing link. Ask staff for the correct link.</div>' : `
-  <form method="POST" action="/lookup?code=${encodeURIComponent(code)}">
-    <input type="tel" name="phone" inputmode="numeric" maxlength="20" placeholder="09XXXXXXXXX" required>
-    <button type="submit">Check My Points</button>
-  </form>
-  `}
-</div>
-</body></html>`
-}
-
-// GET /?code=<code>
-function handlePointsFormPage(req, res) {
-  let parsed
-  try {
-    parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-  } catch (_) {
-    res.writeHead(400, { 'Content-Type': 'text/html' })
-    return res.end('Bad request')
-  }
-  const code = (parsed.searchParams.get('code') || '').trim()
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-  res.end(pointsLookupFormHtml(code))
-}
-
-function countPendingPointsForCode(code) {
-  let n = 0
-  for (const entry of pendingPointsRequests.values()) {
-    if (entry.code === code) n++
-  }
-  return n
-}
-
-// Sibling to resolveTrackRequest() — same "first resolver wins, the other is
-// a no-op via the Map lookup" pattern.
-function resolvePointsRequest(id, status, html) {
-  const entry = pendingPointsRequests.get(id)
-  if (!entry) return
-  clearTimeout(entry.timer)
-  pendingPointsRequests.delete(id)
-  sendPointsHtml(entry.res, Number(status) || 200, String(html || ''))
-}
-
-// POST /lookup?code=<code>, body is application/x-www-form-urlencoded
-// phone=<value> (matching the plain <form> above — no JSON parsing needed).
-function handlePointsLookup(req, res) {
-  let parsedUrl
-  try {
-    parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-  } catch (_) {
-    return sendPointsHtml(res, 400, unreachablePageHtml())
-  }
-  const code = (parsedUrl.searchParams.get('code') || '').trim()
-
-  if (!code || code.length > MAX_CODE_LENGTH) {
-    // Nothing read from the body yet — respond and let the connection close
-    // itself via the Connection: close header, same as mobile-upload's
-    // equivalent early-rejection paths. Explicitly destroying the request
-    // stream HERE (before any body bytes have arrived) raced with writing
-    // the response on the same socket and surfaced as a client-side
-    // "socket hang up" instead of a clean 400 during testing — the
-    // Connection: close header achieves the same "don't keep this
-    // connection around" goal without that race.
-    return sendPointsHtml(res, 400, unreachablePageHtml(), true)
-  }
-
-  // Rate limit BEFORE any Host round-trip work — cheap early rejection,
-  // keyed on IP+code so this is independent per (caller, shop) pair.
-  const ip = getClientIp(req)
-  const rateLimitKey = `${ip}:${code}`
-  if (!checkAndConsume(rateLimitKey, { limit: POINTS_LOOKUP_RATE_LIMIT, windowMs: POINTS_LOOKUP_RATE_WINDOW_MS })) {
-    log(`[points] rate limit exceeded for ip=${ip}, code=${maskCode(code)}`)
-    return sendPointsHtml(res, 429, tooManyAttemptsPageHtml(), true)
-  }
-  sweepExpired(POINTS_LOOKUP_RATE_WINDOW_MS)
-
-  // Presence gate — identical to /track and /mobile-upload: respond
-  // immediately if no Host is connected, never wait out the 8s timeout for
-  // a shop that plainly isn't reachable right now.
-  const pair = pairings.get(code)
-  const hostWs = pair && pair.host
-  if (!hostWs || hostWs.readyState !== hostWs.OPEN) {
-    return sendPointsHtml(res, 503, unreachablePageHtml(), true)
-  }
-
-  if (
-    pendingPointsRequests.size >= MAX_PENDING_POINTS_GLOBAL ||
-    countPendingPointsForCode(code) >= MAX_PENDING_POINTS_PER_CODE
-  ) {
-    log(`[points] rejecting request for code=${maskCode(code)} — concurrency cap reached`)
-    return sendPointsHtml(res, 503, unreachablePageHtml(), true)
-  }
-
-  const chunks = []
-  let received = 0
-  let rejected = false
-
-  req.on('data', (chunk) => {
-    if (rejected) return
-    received += chunk.length
-    if (received > POINTS_LOOKUP_MAX_BODY_BYTES) {
-      rejected = true
-      req.destroy()
-      sendPointsHtml(res, 413, unreachablePageHtml(), true)
-      return
-    }
-    chunks.push(chunk)
-  })
-
-  req.on('error', () => {})
-
-  req.on('end', () => {
-    if (rejected) return
-
-    let phone = ''
-    try {
-      const body = new URLSearchParams(Buffer.concat(chunks).toString('utf-8'))
-      phone = String(body.get('phone') || '').trim()
-    } catch (_) {
-      phone = ''
-    }
-
-    const id = randomBytes(8).toString('hex')
-    const timer = setTimeout(() => {
-      log(`[points] request ${id.slice(0, 8)}... timed out waiting for Host (code=${maskCode(code)})`)
-      resolvePointsRequest(id, 503, unreachablePageHtml())
-    }, POINTS_REQUEST_TIMEOUT_MS)
-
-    pendingPointsRequests.set(id, { res, timer, code })
-
-    try {
-      hostWs.send(JSON.stringify({ type: 'points_request', id, phone }))
-    } catch (_) {
-      clearTimeout(timer)
-      pendingPointsRequests.delete(id)
-      sendPointsHtml(res, 503, unreachablePageHtml())
-    }
-  })
-}
-
 // noServer so we can validate the query string before accepting the upgrade.
 // perMessageDeflate is explicitly disabled (not just left at its default) so
 // a future 'ws' version bump can't silently change this and reintroduce a
@@ -1032,32 +649,6 @@ wss.on('connection', (ws) => {
 
   // Forward raw frames to the peer, preserving text/binary type.
   ws.on('message', (data, isBinary) => {
-    // Mobile Data QR Job Order Tracking: a 'track_response' from the Host is
-    // consumed BY THIS RELAY (resolving a pending phone HTTP request held in
-    // pendingTrackRequests) — it is never forwarded to a 'client' peer. This
-    // is the one host->relay message type the relay actually parses and acts
-    // on; every other host->relay message (WS 'response'/'event' payloads
-    // for Remote Access) is untouched raw-frame forwarding, exactly as
-    // before this feature.
-    if (role === 'host' && !isBinary) {
-      let parsed = null
-      try {
-        parsed = JSON.parse(data.toString())
-      } catch (_) {
-        parsed = null
-      }
-      if (parsed && parsed.type === 'track_response') {
-        resolveTrackRequest(parsed.id, parsed.status, parsed.html)
-        return
-      }
-      if (parsed && parsed.type === 'points_response') {
-        // Sibling to track_response above — same "consumed by this relay,
-        // never forwarded to a client peer" handling.
-        resolvePointsRequest(parsed.id, parsed.status, parsed.html)
-        return
-      }
-    }
-
     const current = pairings.get(code)
     const target = current ? current[peerRole(role)] : null
     if (target && target.readyState === target.OPEN) {
@@ -1076,23 +667,6 @@ wss.on('connection', (ws) => {
     }
     log(`[${maskCode(code)}] ${role} disconnected`)
     cleanupPairing(code)
-    // A Host disconnecting mid-flight means it can no longer answer any
-    // 'track_request' already sent to it on this code — resolve those now
-    // rather than making the waiting phone(s) sit out the full 8s timeout.
-    if (role === 'host') {
-      for (const [id, entry] of pendingTrackRequests) {
-        if (entry.code === code) {
-          resolveTrackRequest(id, 503, unreachablePageHtml())
-        }
-      }
-      // Same cleanup, sibling map — a Host disconnecting mid-flight can't
-      // answer any 'points_request' already sent to it either.
-      for (const [id, entry] of pendingPointsRequests) {
-        if (entry.code === code) {
-          resolvePointsRequest(id, 503, unreachablePageHtml())
-        }
-      }
-    }
   })
 
   ws.on('error', (err) => {

@@ -14,6 +14,9 @@ show_help() {
   echo "  nxtech on  <machineId>   Reactivate a client"
   echo "  nxtech remove <machineId> Remove a client permanently"
   echo "  nxtech status            Show relay server status"
+  echo "  nxtech off <machineId> <feature|all>   Deactivate a client's feature(s)"
+  echo "  nxtech on  <machineId> <feature|all>   Reactivate a client's feature(s)"
+  echo "  (feature = remote_access | mobile_data | all)"
   echo ""
 }
 
@@ -21,15 +24,19 @@ case "$1" in
 
   list)
     echo ""
-    echo "=== Active Subscribers ==="
+    echo "=== Subscribers ==="
     curl -s "$BASE_URL/subscribers" \
       -H "Authorization: Bearer $ADMIN_TOKEN" | \
       node -e "
         const d = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
         if (!d.subscribers.length) { console.log('  (none)'); process.exit(); }
         d.subscribers.forEach(s => {
-          const status = s.active ? '✓ ACTIVE  ' : '✗ INACTIVE';
-          console.log(status + ' | ' + s.machineId + ' | ' + s.label + ' | ' + (s.notes||''));
+          const ra = s.features && s.features.remote_access;
+          const md = s.features && s.features.mobile_data;
+          const anyOn = ra || md;
+          const status = anyOn ? '✓ ACTIVE  ' : '✗ INACTIVE';
+          const detail = 'remote:' + (ra ? 'on ' : 'off') + ' mobile:' + (md ? 'on ' : 'off');
+          console.log(status + ' | ' + s.machineId + ' | ' + s.label + ' | ' + detail + ' | ' + (s.notes||''));
         });
       "
     echo ""
@@ -55,25 +62,39 @@ case "$1" in
     ;;
 
   off)
-    if [ -z "$2" ]; then echo "Usage: nxtech off <machineId>"; exit 1; fi
-    RESULT=$(curl -s -X PATCH "$BASE_URL/subscribers/$2" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d '{"active":false}')
-    echo "$RESULT" | grep -q '"ok":true' && \
-      echo "✓ Deactivated: $2 — relay access BLOCKED" || \
-      echo "✗ Failed: $RESULT"
+    if [ -z "$2" ] || [ -z "$3" ]; then
+      echo "Usage: nxtech off <machineId> <remote_access|mobile_data|all>"
+      exit 1
+    fi
+    FEATURES=("$3")
+    if [ "$3" == "all" ]; then FEATURES=("remote_access" "mobile_data"); fi
+    for F in "${FEATURES[@]}"; do
+      RESULT=$(curl -s -X PATCH "$BASE_URL/subscribers/$2" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"feature\":\"$F\",\"active\":false}")
+      echo "$RESULT" | grep -q '"ok":true' && \
+        echo "✓ Deactivated $F for: $2" || \
+        echo "✗ Failed ($F): $RESULT"
+    done
     ;;
 
   on)
-    if [ -z "$2" ]; then echo "Usage: nxtech on <machineId>"; exit 1; fi
-    RESULT=$(curl -s -X PATCH "$BASE_URL/subscribers/$2" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d '{"active":true}')
-    echo "$RESULT" | grep -q '"ok":true' && \
-      echo "✓ Reactivated: $2 — relay access RESTORED" || \
-      echo "✗ Failed: $RESULT"
+    if [ -z "$2" ] || [ -z "$3" ]; then
+      echo "Usage: nxtech on <machineId> <remote_access|mobile_data|all>"
+      exit 1
+    fi
+    FEATURES=("$3")
+    if [ "$3" == "all" ]; then FEATURES=("remote_access" "mobile_data"); fi
+    for F in "${FEATURES[@]}"; do
+      RESULT=$(curl -s -X PATCH "$BASE_URL/subscribers/$2" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"feature\":\"$F\",\"active\":true}")
+      echo "$RESULT" | grep -q '"ok":true' && \
+        echo "✓ Reactivated $F for: $2" || \
+        echo "✗ Failed ($F): $RESULT"
+    done
     ;;
 
   remove)
