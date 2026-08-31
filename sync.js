@@ -213,20 +213,41 @@ export async function handleSyncRegister(req, res) {
     return sendJson(res, 403, { ok: false, error: 'Remote Monitoring requires a Premium license.' })
   }
 
+  // Identity for the shops table is the license, not the machine -- each
+  // branch necessarily has its own separate license, so this has no
+  // collision path the way machine_id did (see the 2026-08-31 audit
+  // follow-up: two branches could silently merge into one shop record
+  // whenever their machine_id happened to collide, e.g. branch 2 set up by
+  // disk-cloning branch 1's PC image). machine_id is still stored, just no
+  // longer the identity key.
+  const licenseKeyHash = sha256(licenseKey)
+
   const now = nowIso()
   const run = db.transaction(() => {
-    let shop = db.prepare('SELECT * FROM shops WHERE machine_id = ?').get(machineId)
+    let shop = db.prepare('SELECT * FROM shops WHERE license_key_hash = ?').get(licenseKeyHash)
+    if (!shop) {
+      // Fallback for a row created before this fix, which has no
+      // license_key_hash yet -- claim it by machine_id exactly once, the
+      // same way this shop would have matched under the old scheme, and
+      // backfill its hash below so every later call goes through the
+      // license_key_hash branch above instead. Scoped to
+      // `license_key_hash IS NULL` so a shop that already has an owner
+      // hash can never be re-claimed by a different license's machine_id
+      // match.
+      shop = db
+        .prepare('SELECT * FROM shops WHERE machine_id = ? AND license_key_hash IS NULL')
+        .get(machineId)
+    }
     if (shop) {
-      db.prepare('UPDATE shops SET shop_name = ?, tier = ?, last_seen_at = ? WHERE id = ?').run(
-        shopName || shop.shop_name,
-        verification.tier,
-        now,
-        shop.id
-      )
+      db.prepare(
+        'UPDATE shops SET license_key_hash = ?, machine_id = ?, shop_name = ?, tier = ?, last_seen_at = ? WHERE id = ?'
+      ).run(licenseKeyHash, machineId, shopName || shop.shop_name, verification.tier, now, shop.id)
     } else {
       const result = db
-        .prepare('INSERT INTO shops (machine_id, shop_name, tier, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)')
-        .run(machineId, shopName, verification.tier, now, now)
+        .prepare(
+          'INSERT INTO shops (license_key_hash, machine_id, shop_name, tier, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)'
+        )
+        .run(licenseKeyHash, machineId, shopName, verification.tier, now, now)
       shop = { id: result.lastInsertRowid }
     }
 

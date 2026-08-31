@@ -29,16 +29,24 @@ db.pragma('foreign_keys = ON')
 
 db.exec(`
   -- One row per shop that has ever self-registered for Remote Monitoring.
-  -- Keyed by machine_id (the license payload's own 'm' field) -- there is
-  -- no license_id in the NXV2 key format to key by instead.
+  -- Keyed by a hash of the license_key (each branch necessarily has its own
+  -- separate license), NOT by machine_id. machine_id is stored for display
+  -- only -- see the 2026-08 audit follow-up: keying by machine_id let two
+  -- genuinely different branches silently merge into one shop record
+  -- whenever their machine_id happened to collide (e.g. branch 2 set up by
+  -- disk-cloning branch 1's PC image, which copies Windows' MachineGuid
+  -- byte-for-byte). license_key_hash has no such collision path -- two
+  -- branches always have two different licenses.
   CREATE TABLE IF NOT EXISTS shops (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    machine_id TEXT UNIQUE NOT NULL,
+    license_key_hash TEXT UNIQUE,
+    machine_id TEXT NOT NULL,
     shop_name TEXT,
     tier TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_seen_at TEXT
   );
+  CREATE INDEX IF NOT EXISTS idx_shops_machine_id ON shops(machine_id);
 
   -- App -> relay push auth. Token is a random high-entropy value; only its
   -- SHA-256 hash is ever stored, so a leaked DB file doesn't hand over live
@@ -123,6 +131,66 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_shop ON dashboard_sessions(shop_id);
   CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_session_id ON dashboard_sessions(session_id);
 `)
+
+// ---------------------------------------------------------------------------
+// Migration: shops keyed by license_key_hash, not machine_id.
+//
+// See the audit follow-up dated 2026-08-31 for the full incident writeup.
+// A database created before this fix has `machine_id TEXT UNIQUE NOT NULL`
+// and no `license_key_hash` column -- two genuinely different branches
+// could silently merge into one shop record whenever their machine_id
+// happened to collide (e.g. branch 2 set up by disk-cloning branch 1's PC
+// image, which copies Windows' MachineGuid byte-for-byte). SQLite has no
+// ALTER TABLE DROP CONSTRAINT, so removing that unique constraint needs a
+// full table rebuild. Idempotent -- a no-op once shops.license_key_hash
+// already exists (true immediately for a fresh install, since the
+// CREATE TABLE IF NOT EXISTS above already has the new shape).
+// ---------------------------------------------------------------------------
+function migrateShopsTableToLicenseKeyHash() {
+  const columns = db.prepare('PRAGMA table_info(shops)').all()
+  if (columns.some((c) => c.name === 'license_key_hash')) return // already migrated
+
+  console.log('[db] migrating shops table: unique key machine_id -> license_key_hash')
+
+  // PRAGMA foreign_keys can't be toggled inside a transaction, so it's set
+  // outside the transaction() call, not inside it. Every child table
+  // (sync_tokens, pairing_codes, dashboard_sessions, snapshots) keeps
+  // referencing shops(id) unchanged -- ids are preserved by the copy below,
+  // so no child-table rows need touching.
+  db.pragma('foreign_keys = OFF')
+  const migrate = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE shops_migrated (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        license_key_hash TEXT UNIQUE,
+        machine_id TEXT NOT NULL,
+        shop_name TEXT,
+        tier TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT
+      );
+    `)
+    // license_key_hash starts NULL for every pre-existing row -- the raw
+    // license_key was never stored on this table, so it can't be backfilled
+    // here. Each shop's own app fills it in automatically the next time it
+    // calls /sync/register (see handleSyncRegister's fallback lookup in
+    // sync.js), which happens on its next ordinary connectivity -- no
+    // customer action required.
+    db.exec(`
+      INSERT INTO shops_migrated (id, machine_id, shop_name, tier, created_at, last_seen_at)
+      SELECT id, machine_id, shop_name, tier, created_at, last_seen_at FROM shops;
+    `)
+    db.exec('DROP TABLE shops;')
+    db.exec('ALTER TABLE shops_migrated RENAME TO shops;')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_shops_machine_id ON shops(machine_id);')
+  })
+  migrate()
+  db.pragma('foreign_keys = ON')
+
+  console.log('[db] shops table migration complete')
+}
+
+migrateShopsTableToLicenseKeyHash()
 
 export function nowIso() {
   return new Date().toISOString()
