@@ -53,7 +53,7 @@ import {
   handleSessionsList,
   handleSessionRevoke
 } from './sync.js'
-import { handleDashboardClaim, handleDashboardEntityList, handleDashboardOptions } from './dashboard.js'
+import { handleDashboardClaim, handleDashboardEntityList, handleDashboardOptions, handleDashboardForget, handleDashboardSessionsList } from './dashboard.js'
 
 const PORT = Number(process.env.PORT || process.env.RELAY_PORT || 8787)
 const HOST = process.env.HOST || '0.0.0.0'
@@ -228,6 +228,17 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'POST' && req.url.startsWith('/dashboard/claim')) {
     handleDashboardClaim(req, res)
+    return
+  }
+  if (req.method === 'POST' && req.url.startsWith('/dashboard/forget')) {
+    handleDashboardForget(req, res)
+    return
+  }
+  // Branch switcher's own listing -- must be checked before the generic
+  // /dashboard/:entityType fallback below, since 'sessions' isn't (and
+  // must never become) one of DASHBOARD_ENTITY_ROUTES' slugs.
+  if (req.method === 'GET' && req.url.startsWith('/dashboard/sessions')) {
+    handleDashboardSessionsList(req, res)
     return
   }
   // /dashboard/:entityType -- basic snapshot list, one route per known
