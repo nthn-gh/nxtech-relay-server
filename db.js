@@ -130,6 +130,24 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_shop ON dashboard_sessions(shop_id);
   CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_session_id ON dashboard_sessions(session_id);
+
+  -- AI-assisted resume generation (Premium feature, resume.js). One row
+  -- per successful OpenAI call -- this table IS the durable per-shop daily
+  -- quota (resume.js queries COUNT(*) WHERE shop_id = ? AND created_at >=
+  -- <start of current UTC day>), deliberately not the in-memory
+  -- rateLimiter.js used elsewhere in this relay, since a process restart
+  -- must not silently reopen a shop's quota for a feature that costs real
+  -- money per call. input_chars/output_chars are character counts only
+  -- (not the actual resume text) -- usage/cost visibility without storing
+  -- customer PII (names, contact info, work history) in this database.
+  CREATE TABLE IF NOT EXISTS resume_generations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER NOT NULL REFERENCES shops(id),
+    created_at TEXT NOT NULL,
+    input_chars INTEGER,
+    output_chars INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_resume_generations_shop_created ON resume_generations(shop_id, created_at);
 `)
 
 // ---------------------------------------------------------------------------
