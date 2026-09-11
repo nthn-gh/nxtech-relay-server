@@ -54,6 +54,7 @@ import {
   handleSessionRevoke
 } from './sync.js'
 import { handleDashboardClaim, handleDashboardEntityList, handleDashboardOptions, handleDashboardForget, handleDashboardSessionsList } from './dashboard.js'
+import { handleResumeGenerate } from './resume.js'
 
 const PORT = Number(process.env.PORT || process.env.RELAY_PORT || 8787)
 const HOST = process.env.HOST || '0.0.0.0'
@@ -216,6 +217,16 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'POST' && req.url.startsWith('/sync/sessions/revoke')) {
     handleSessionRevoke(req, res)
+    return
+  }
+
+  // ---------------------------------------------------------------------
+  // AI-assisted resume generation (Premium feature, resume.js). Same
+  // sync_token auth family as /sync/* above; own path since it's a
+  // distinct feature, not part of the monitoring sync protocol.
+  // ---------------------------------------------------------------------
+  if (req.method === 'POST' && req.url.startsWith('/resume/generate')) {
+    handleResumeGenerate(req, res)
     return
   }
 
